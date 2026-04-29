@@ -1,7 +1,5 @@
 streamlit
 tensorflow==2.15.0
-opencv-python-headless
-numpy
+numpy==1.26.4
 pandas
 pillow
-matplotlib
