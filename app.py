@@ -58,55 +58,119 @@ def load_trained_model():
 model = load_trained_model()
 
 # ============================================================
+# DEBUG HELPER
+# ============================================================
+
+def get_model_layer_summary():
+    rows = []
+    for i, layer in enumerate(model.layers):
+        rows.append({
+            "Index": i,
+            "Layer Name": layer.name,
+            "Layer Type": type(layer).__name__
+        })
+    return pd.DataFrame(rows)
+
+# ============================================================
 # PREPARE GRAD-CAM MODELS
 # ============================================================
 
 @st.cache_resource
 def prepare_gradcam_models():
     try:
-        base_model = None
+        # ----------------------------------------------------
+        # Find nested Keras models inside the full model
+        # Example: data_augmentation, densenet121
+        # ----------------------------------------------------
+        nested_models = [
+            layer for layer in model.layers
+            if isinstance(layer, keras.Model)
+        ]
 
-        # Find DenseNet121 base model inside full model
-        for layer in model.layers:
-            if isinstance(layer, keras.Model) and "densenet" in layer.name.lower():
-                base_model = layer
-                break
+        if len(nested_models) == 0:
+            return None, None, None, "No nested Keras model found inside saved model."
 
-        # Fallback: take first nested model
-        if base_model is None:
-            nested_models = [
-                layer for layer in model.layers
-                if isinstance(layer, keras.Model)
-            ]
-            if len(nested_models) > 0:
-                base_model = nested_models[0]
+        candidate_models = []
 
-        if base_model is None:
-            return None, None, None
+        for nested_model in nested_models:
+            conv_like_layer_count = 0
+            total_layers = len(nested_model.layers)
 
-        # Find last convolutional feature layer
+            for sub_layer in nested_model.layers:
+                try:
+                    output_shape = sub_layer.output.shape
+                    if len(output_shape) == 4:
+                        conv_like_layer_count += 1
+                except Exception:
+                    pass
+
+            candidate_models.append({
+                "model": nested_model,
+                "name": nested_model.name,
+                "conv_like_layer_count": conv_like_layer_count,
+                "total_layers": total_layers
+            })
+
+        # ----------------------------------------------------
+        # Select the largest nested model with many 4D features
+        # DenseNet121 will have many more layers than augmentation.
+        # ----------------------------------------------------
+        candidate_models = sorted(
+            candidate_models,
+            key=lambda x: (x["conv_like_layer_count"], x["total_layers"]),
+            reverse=True
+        )
+
+        base_model = candidate_models[0]["model"]
+
+        # Safety check: if selected model has too few layers, Grad-CAM may fail
+        if len(base_model.layers) < 20:
+            return None, None, None, (
+                f"Selected nested model '{base_model.name}' has too few layers. "
+                "DenseNet121 base model was not properly found."
+            )
+
+        # ----------------------------------------------------
+        # Find last 4D convolutional feature layer
+        # ----------------------------------------------------
         last_conv_layer = None
 
-        for layer in reversed(base_model.layers):
+        for sub_layer in reversed(base_model.layers):
             try:
-                if len(layer.output.shape) == 4:
-                    last_conv_layer = layer
+                output_shape = sub_layer.output.shape
+                if len(output_shape) == 4:
+                    last_conv_layer = sub_layer
                     break
             except Exception:
                 continue
 
         if last_conv_layer is None:
-            return None, None, None
+            return None, None, None, "No suitable 4D convolutional feature layer found."
 
-        # Layers after DenseNet base = classifier head
-        base_index = model.layers.index(base_model)
+        # ----------------------------------------------------
+        # Classifier head = layers after base_model in full model
+        # ----------------------------------------------------
+        try:
+            base_index = model.layers.index(base_model)
+        except ValueError:
+            return None, None, None, "Base model was not found in full model layer list."
+
         classifier_layers = model.layers[base_index + 1:]
 
+        if len(classifier_layers) == 0:
+            return None, None, None, "No classifier head layers found after base model."
+
+        # ----------------------------------------------------
+        # Feature extractor
+        # ----------------------------------------------------
         feature_extractor = keras.Model(
             inputs=base_model.input,
             outputs=[last_conv_layer.output, base_model.output]
         )
 
+        # ----------------------------------------------------
+        # Classifier model
+        # ----------------------------------------------------
         classifier_input = keras.Input(shape=base_model.output.shape[1:])
         x = classifier_input
 
@@ -118,13 +182,15 @@ def prepare_gradcam_models():
 
         classifier_model = keras.Model(classifier_input, x)
 
-        return feature_extractor, classifier_model, last_conv_layer.name
+        layer_info = f"{base_model.name} → {last_conv_layer.name}"
 
-    except Exception:
-        return None, None, None
+        return feature_extractor, classifier_model, last_conv_layer.name, layer_info
+
+    except Exception as e:
+        return None, None, None, f"Grad-CAM preparation error: {str(e)}"
 
 
-feature_extractor, classifier_model, gradcam_layer_name = prepare_gradcam_models()
+feature_extractor, classifier_model, gradcam_layer_name, gradcam_status = prepare_gradcam_models()
 
 # ============================================================
 # IMAGE PROCESSING FUNCTIONS
@@ -143,9 +209,8 @@ def prepare_raw_image(image):
 def predict_image(image):
     img_array, img_batch = prepare_raw_image(image)
 
-    # Important:
-    # The saved model already contains preprocessing from training.
-    # So direct img_batch is passed to the full model.
+    # The saved full model already contains preprocessing from training.
+    # So we pass raw 0-255 RGB image batch directly.
     probs = model.predict(img_batch, verbose=0)[0]
 
     pred_idx = int(np.argmax(probs))
@@ -153,7 +218,6 @@ def predict_image(image):
     confidence = float(probs[pred_idx])
 
     return pred_class, confidence, probs, img_array, pred_idx
-
 
 # ============================================================
 # GRAD-CAM FUNCTIONS
@@ -164,10 +228,9 @@ def generate_gradcam(img_array, pred_index=None):
         return None
 
     try:
+        # Here we bypass the full model and directly use DenseNet base.
+        # Therefore DenseNet preprocessing is needed here.
         input_tensor = np.expand_dims(img_array.copy(), axis=0)
-
-        # Here we bypass full model and directly use DenseNet base,
-        # so DenseNet preprocessing is needed.
         input_tensor = keras.applications.densenet.preprocess_input(input_tensor)
 
         with tf.GradientTape() as tape:
@@ -201,7 +264,9 @@ def generate_gradcam(img_array, pred_index=None):
 
         return heatmap.numpy()
 
-    except Exception:
+    except Exception as e:
+        st.error("Grad-CAM generation error.")
+        st.exception(e)
         return None
 
 
@@ -241,7 +306,6 @@ def overlay_heatmap(original_img_array, heatmap, alpha=0.45):
 
     return combined
 
-
 # ============================================================
 # STREAMLIT UI
 # ============================================================
@@ -257,20 +321,34 @@ st.markdown(
     """
 )
 
+# ============================================================
+# SIDEBAR
+# ============================================================
+
 st.sidebar.header("Model Information")
 st.sidebar.write("**Final Model:** Fine-tuned DenseNet121")
 st.sidebar.write("**Test Accuracy:** 97.48%")
 st.sidebar.write("**Weighted F1-score:** 97.50%")
 
 if gradcam_layer_name is not None:
+    st.sidebar.success("Grad-CAM is ready.")
     st.sidebar.write(f"**Grad-CAM Layer:** {gradcam_layer_name}")
+    st.sidebar.caption(gradcam_status)
 else:
-    st.sidebar.warning("Grad-CAM layer could not be prepared.")
+    st.sidebar.error("Grad-CAM could not be prepared.")
+    st.sidebar.caption(gradcam_status)
 
 st.sidebar.warning(
     "This app performs image-level classification only. "
     "It does not provide bounding-box object detection."
 )
+
+with st.sidebar.expander("Model Layers Debug"):
+    st.dataframe(get_model_layer_summary(), use_container_width=True)
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
 
 uploaded_file = st.file_uploader(
     "Upload a roadside damage image",
@@ -278,6 +356,10 @@ uploaded_file = st.file_uploader(
 )
 
 show_gradcam = st.checkbox("Show Grad-CAM explanation", value=True)
+
+# ============================================================
+# MAIN APP
+# ============================================================
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
@@ -319,6 +401,10 @@ if uploaded_file is not None:
 
         if feature_extractor is None or classifier_model is None:
             st.error("Grad-CAM could not be prepared for this model.")
+            st.info(
+                "Open the sidebar 'Model Layers Debug' section and check whether "
+                "a DenseNet121 or large Functional model appears in the saved model."
+            )
         else:
             with st.spinner("Generating Grad-CAM heatmap..."):
                 heatmap = generate_gradcam(img_array, pred_index=pred_idx)
