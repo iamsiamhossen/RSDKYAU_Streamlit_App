@@ -1,10 +1,13 @@
 import os
-import streamlit as st
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
+import streamlit as st
 import tensorflow as tf
 from PIL import Image, ImageFilter
 from tensorflow import keras
+
 
 # ============================================================
 # PAGE CONFIG
@@ -15,6 +18,7 @@ st.set_page_config(
     page_icon="🛣️",
     layout="wide"
 )
+
 
 # ============================================================
 # BASIC CONFIG
@@ -29,13 +33,20 @@ CLASS_NAMES = [
     "open_drain_dataset"
 ]
 
+DISPLAY_NAMES = {
+    "Pot hole": "Pothole",
+    "crack_dataset": "Crack",
+    "edge_damage": "Edge Damage",
+    "open_drain_dataset": "Open Drain"
+}
+
 IMG_SIZE = (224, 224)
 
-# PIL compatibility for resampling
 try:
     RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
 except AttributeError:
     RESAMPLE_BICUBIC = Image.BICUBIC
+
 
 # ============================================================
 # LOAD MODEL
@@ -44,32 +55,29 @@ except AttributeError:
 @st.cache_resource
 def load_trained_model():
     if not os.path.exists(MODEL_PATH):
-        st.error(f"Model file not found: {MODEL_PATH}")
+        st.error(f"Model file not found: `{MODEL_PATH}`")
         st.stop()
 
     try:
-        model = keras.models.load_model(
+        return keras.models.load_model(
             MODEL_PATH,
             compile=False,
             safe_mode=False
         )
-        return model
     except Exception as e:
         st.error("Model loading failed.")
         st.exception(e)
         st.stop()
 
+
 model = load_trained_model()
+
 
 # ============================================================
 # SAFE HELPERS
 # ============================================================
 
 def get_tensor_shape_safe(output_object):
-    """
-    Safely return tensor shape.
-    Some layers may return list/tuple outputs.
-    """
     try:
         if isinstance(output_object, (list, tuple)):
             if len(output_object) == 0:
@@ -85,9 +93,6 @@ def get_tensor_shape_safe(output_object):
 
 
 def is_4d_output(layer):
-    """
-    Returns True if layer output is a 4D tensor.
-    """
     try:
         shape = get_tensor_shape_safe(layer.output)
         return shape is not None and len(shape) == 4
@@ -97,6 +102,7 @@ def is_4d_output(layer):
 
 def get_model_layer_summary():
     rows = []
+
     for i, layer in enumerate(model.layers):
         try:
             sub_layers = len(layer.layers) if isinstance(layer, keras.Model) else "-"
@@ -109,15 +115,17 @@ def get_model_layer_summary():
             "Layer Type": type(layer).__name__,
             "Sub Layers": sub_layers
         })
+
     return pd.DataFrame(rows)
+
 
 # ============================================================
 # PREPARE GRAD-CAM
 # ============================================================
 
+@st.cache_resource
 def prepare_gradcam_models():
     try:
-        # Find nested keras models inside the full saved model
         nested_models = [
             layer for layer in model.layers
             if isinstance(layer, keras.Model)
@@ -143,7 +151,6 @@ def prepare_gradcam_models():
                 "total_layers": total_layers
             })
 
-        # Prefer model with most 4D layers and more total layers
         candidate_models = sorted(
             candidate_models,
             key=lambda x: (x["conv_like_layer_count"], x["total_layers"]),
@@ -160,10 +167,6 @@ def prepare_gradcam_models():
 
         base_model = candidate_models[0]["model"]
 
-        # ----------------------------------------------------
-        # Choose a slightly earlier higher-resolution feature layer
-        # Prefer 14x14 or larger; last 7x7 layer often gives blurry CAM
-        # ----------------------------------------------------
         all_4d_layers = []
 
         for sub_layer in base_model.layers:
@@ -182,8 +185,11 @@ def prepare_gradcam_models():
         if len(all_4d_layers) == 0:
             return None, None, None, f"No suitable 4D feature layer found. Candidates: {debug_text}"
 
-        # Prefer final 14x14 or larger feature map
-        high_res_layers = [item for item in all_4d_layers if item[1] >= 14 and item[2] >= 14]
+        # Prefer a 14x14 or larger feature map for clearer Grad-CAM.
+        high_res_layers = [
+            item for item in all_4d_layers
+            if item[1] >= 14 and item[2] >= 14
+        ]
 
         if len(high_res_layers) > 0:
             selected_layer, h, w = high_res_layers[-1]
@@ -193,9 +199,6 @@ def prepare_gradcam_models():
         selected_shape = f"{h}x{w}"
         last_conv_layer = selected_layer
 
-        # ----------------------------------------------------
-        # Build classifier head from layers after base_model
-        # ----------------------------------------------------
         try:
             base_index = model.layers.index(base_model)
         except ValueError:
@@ -230,7 +233,7 @@ def prepare_gradcam_models():
         status = (
             f"Grad-CAM ready. Selected base model: {base_model.name}; "
             f"selected feature layer: {last_conv_layer.name}; "
-            f"feature map size: {selected_shape}. Candidates: {debug_text}"
+            f"feature map size: {selected_shape}."
         )
 
         return feature_extractor, classifier_model, last_conv_layer.name, status
@@ -240,6 +243,7 @@ def prepare_gradcam_models():
 
 
 feature_extractor, classifier_model, gradcam_layer_name, gradcam_status = prepare_gradcam_models()
+
 
 # ============================================================
 # IMAGE PROCESSING
@@ -258,9 +262,7 @@ def prepare_raw_image(image):
 def predict_image(image):
     img_array, img_batch = prepare_raw_image(image)
 
-    # Important:
-    # This assumes your saved full model already contains preprocessing
-    # from training. তাই full model-এ raw image batch pass করা হচ্ছে.
+    # The saved full model already includes DenseNet preprocessing from training.
     probs = model.predict(img_batch, verbose=0)[0]
 
     pred_idx = int(np.argmax(probs))
@@ -268,6 +270,7 @@ def predict_image(image):
     confidence = float(probs[pred_idx])
 
     return pred_class, confidence, probs, img_array, pred_idx
+
 
 # ============================================================
 # GRAD-CAM FUNCTIONS
@@ -278,12 +281,17 @@ def generate_gradcam(img_array, pred_index=None):
         return None
 
     try:
-        # Since we directly use DenseNet base, base preprocessing is needed
         input_tensor = np.expand_dims(img_array.copy(), axis=0)
+
+        # We bypass the full model and use DenseNet base directly.
         input_tensor = keras.applications.densenet.preprocess_input(input_tensor)
 
         with tf.GradientTape() as tape:
-            conv_outputs, base_outputs = feature_extractor(input_tensor, training=False)
+            conv_outputs, base_outputs = feature_extractor(
+                input_tensor,
+                training=False
+            )
+
             tape.watch(conv_outputs)
 
             preds = classifier_model(base_outputs, training=False)
@@ -318,29 +326,21 @@ def generate_gradcam(img_array, pred_index=None):
         return None
 
 
-def refine_heatmap(heatmap):
-    """
-    Improve visibility of Grad-CAM:
-    - normalize
-    - suppress weak background activation
-    - slightly sharpen strong regions
-    """
+def refine_heatmap(heatmap, threshold_percentile=55):
     heatmap = np.maximum(heatmap, 0)
     heatmap = heatmap / (np.max(heatmap) + 1e-8)
 
-    # Suppress weak activation
-    threshold = np.percentile(heatmap, 55)
+    threshold = np.percentile(heatmap, threshold_percentile)
     heatmap = np.where(heatmap >= threshold, heatmap, 0)
 
-    # Slight contrast enhancement
     heatmap = np.power(heatmap, 0.8)
     heatmap = heatmap / (np.max(heatmap) + 1e-8)
 
     return heatmap
 
 
-def make_heatmap_image(heatmap):
-    heatmap = refine_heatmap(heatmap)
+def make_heatmap_image(heatmap, threshold_percentile=55):
+    heatmap = refine_heatmap(heatmap, threshold_percentile)
 
     heatmap_img = Image.fromarray(np.uint8(255 * heatmap))
     heatmap_img = heatmap_img.resize(IMG_SIZE, resample=RESAMPLE_BICUBIC)
@@ -348,26 +348,22 @@ def make_heatmap_image(heatmap):
 
     heatmap_array = np.array(heatmap_img).astype(np.float32) / 255.0
 
-    # Professional black-red-yellow heatmap
     color_heatmap = np.zeros((IMG_SIZE[1], IMG_SIZE[0], 3), dtype=np.uint8)
 
-    # Red channel strong
     color_heatmap[..., 0] = np.uint8(255 * heatmap_array)
 
-    # Green grows in stronger regions
     green_component = np.maximum(heatmap_array - 0.25, 0) / 0.75
     color_heatmap[..., 1] = np.uint8(220 * green_component)
 
-    # Low blue for visual smoothness
     color_heatmap[..., 2] = np.uint8(30 * (1 - heatmap_array) * (heatmap_array > 0))
 
     return Image.fromarray(color_heatmap)
 
 
-def overlay_heatmap(original_img_array, heatmap, alpha=0.50):
+def overlay_heatmap(original_img_array, heatmap, alpha=0.50, threshold_percentile=55):
     original = Image.fromarray(original_img_array.astype(np.uint8)).convert("RGBA")
 
-    heatmap = refine_heatmap(heatmap)
+    heatmap = refine_heatmap(heatmap, threshold_percentile)
 
     heatmap_img = Image.fromarray(np.uint8(255 * heatmap))
     heatmap_img = heatmap_img.resize(IMG_SIZE, resample=RESAMPLE_BICUBIC)
@@ -377,7 +373,6 @@ def overlay_heatmap(original_img_array, heatmap, alpha=0.50):
 
     overlay_rgba = np.zeros((IMG_SIZE[1], IMG_SIZE[0], 4), dtype=np.uint8)
 
-    # Red-yellow overlay
     overlay_rgba[..., 0] = 255
     overlay_rgba[..., 1] = np.uint8(180 * heatmap_array)
     overlay_rgba[..., 2] = 0
@@ -388,6 +383,36 @@ def overlay_heatmap(original_img_array, heatmap, alpha=0.50):
 
     return combined
 
+
+# ============================================================
+# REPORT HELPER
+# ============================================================
+
+def create_prediction_report(pred_class, confidence, probs):
+    rows = []
+
+    for cls, prob in zip(CLASS_NAMES, probs):
+        rows.append({
+            "Class": DISPLAY_NAMES[cls],
+            "Probability": round(float(prob), 6),
+            "Probability (%)": round(float(prob) * 100, 2)
+        })
+
+    df = pd.DataFrame(rows)
+
+    report = {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Final Model": "Fine-tuned DenseNet121",
+        "Predicted Class": DISPLAY_NAMES[pred_class],
+        "Confidence (%)": round(confidence * 100, 2),
+        "Note": "Image-level classification only; not bounding-box object detection."
+    }
+
+    report_df = pd.DataFrame([report])
+
+    return report_df, df
+
+
 # ============================================================
 # STREAMLIT UI
 # ============================================================
@@ -396,21 +421,58 @@ st.title("RSDKYAU Roadside Damage Classification")
 
 st.markdown(
     """
-    This web application uses a **fine-tuned DenseNet121** model to classify roadside
-    infrastructure defects into four categories:
+    This web application demonstrates a **fine-tuned DenseNet121** model for
+    image-level roadside infrastructure defect classification.
 
-    **Pot hole, crack, edge damage, and open drain.**
+    The model classifies an uploaded image into one of four classes:
+    **Pothole, Crack, Edge Damage, or Open Drain**.
     """
 )
+
+metric_col1, metric_col2, metric_col3 = st.columns(3)
+metric_col1.metric("Final Model", "DenseNet121")
+metric_col2.metric("Test Accuracy", "97.48%")
+metric_col3.metric("Weighted F1-score", "97.50%")
+
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
+st.sidebar.header("Settings")
+
+confidence_threshold = st.sidebar.slider(
+    "Confidence threshold",
+    min_value=0.30,
+    max_value=0.95,
+    value=0.70,
+    step=0.05
+)
+
+gradcam_alpha = st.sidebar.slider(
+    "Grad-CAM overlay strength",
+    min_value=0.20,
+    max_value=0.80,
+    value=0.50,
+    step=0.05
+)
+
+heatmap_threshold = st.sidebar.slider(
+    "Grad-CAM background suppression",
+    min_value=30,
+    max_value=80,
+    value=55,
+    step=5
+)
+
 st.sidebar.header("Model Information")
 st.sidebar.write("**Final Model:** Fine-tuned DenseNet121")
-st.sidebar.write("**Test Accuracy:** 97.48%")
-st.sidebar.write("**Weighted F1-score:** 97.50%")
+st.sidebar.write("**Task:** Image-level classification")
+st.sidebar.write("**Classes:** 4")
+st.sidebar.warning(
+    "This app does not draw bounding boxes. "
+    "Grad-CAM is for visual explanation only, not pixel-level segmentation."
+)
 
 if gradcam_layer_name is not None:
     st.sidebar.success("Grad-CAM is ready.")
@@ -420,13 +482,9 @@ else:
     st.sidebar.error("Grad-CAM could not be prepared.")
     st.sidebar.caption(gradcam_status)
 
-st.sidebar.warning(
-    "This app performs image-level classification only. "
-    "It does not provide bounding-box object detection."
-)
-
 with st.sidebar.expander("Model Layers Debug"):
     st.dataframe(get_model_layer_summary(), use_container_width=True)
+
 
 # ============================================================
 # FILE UPLOAD
@@ -439,6 +497,7 @@ uploaded_file = st.file_uploader(
 
 show_gradcam = st.checkbox("Show Grad-CAM explanation", value=True)
 
+
 # ============================================================
 # MAIN APP
 # ============================================================
@@ -449,7 +508,17 @@ if uploaded_file is not None:
     with st.spinner("Analyzing image..."):
         pred_class, confidence, probs, img_array, pred_idx = predict_image(image)
 
-    col1, col2 = st.columns(2)
+    sorted_indices = np.argsort(probs)[::-1]
+    top1_idx = int(sorted_indices[0])
+    top2_idx = int(sorted_indices[1])
+
+    top1_class = CLASS_NAMES[top1_idx]
+    top2_class = CLASS_NAMES[top2_idx]
+
+    top1_prob = float(probs[top1_idx])
+    top2_prob = float(probs[top2_idx])
+
+    col1, col2 = st.columns([1, 1])
 
     with col1:
         st.subheader("Uploaded Image")
@@ -458,35 +527,60 @@ if uploaded_file is not None:
     with col2:
         st.subheader("Prediction Result")
 
-        if confidence >= 0.70:
-            st.success(f"Predicted Class: {pred_class}")
+        display_pred_class = DISPLAY_NAMES[pred_class]
+
+        if confidence >= confidence_threshold:
+            st.success(f"Predicted Class: {display_pred_class}")
         else:
-            st.warning(f"Low-confidence Prediction: {pred_class}")
+            st.warning(f"Low-confidence Prediction: {display_pred_class}")
 
         st.info(f"Confidence: {confidence * 100:.2f}%")
 
+        t1, t2 = st.columns(2)
+        t1.metric("Top-1 Prediction", DISPLAY_NAMES[top1_class], f"{top1_prob * 100:.2f}%")
+        t2.metric("Top-2 Prediction", DISPLAY_NAMES[top2_class], f"{top2_prob * 100:.2f}%")
+
         prob_df = pd.DataFrame({
-            "Class": CLASS_NAMES,
-            "Probability": probs
+            "Class": [DISPLAY_NAMES[c] for c in CLASS_NAMES],
+            "Probability": probs,
+            "Probability (%)": probs * 100
         })
 
-        st.subheader("Class Probability")
-        st.bar_chart(prob_df.set_index("Class"))
-        st.dataframe(prob_df, use_container_width=True)
+        prob_df = prob_df.sort_values("Probability", ascending=False).reset_index(drop=True)
 
-    # ========================================================
-    # GRAD-CAM SECTION
-    # ========================================================
+        st.subheader("Class Probability")
+        st.bar_chart(prob_df.set_index("Class")["Probability"])
+        st.dataframe(
+            prob_df.style.format({
+                "Probability": "{:.4f}",
+                "Probability (%)": "{:.2f}%"
+            }),
+            use_container_width=True
+        )
+
+    report_df, prob_report_df = create_prediction_report(pred_class, confidence, probs)
+
+    report_csv = pd.concat(
+        [
+            report_df,
+            pd.DataFrame([{}]),
+            prob_report_df
+        ],
+        ignore_index=True
+    ).to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="Download Prediction Report CSV",
+        data=report_csv,
+        file_name="rsdkyau_prediction_report.csv",
+        mime="text/csv"
+    )
 
     if show_gradcam:
         st.subheader("Grad-CAM Explanation")
 
         if feature_extractor is None or classifier_model is None:
             st.error("Grad-CAM could not be prepared for this model.")
-            st.info(
-                "Open the sidebar 'Model Layers Debug' section and check whether "
-                "a DenseNet121 or large Functional model appears in the saved model."
-            )
         else:
             with st.spinner("Generating Grad-CAM heatmap..."):
                 heatmap = generate_gradcam(img_array, pred_index=pred_idx)
@@ -494,8 +588,17 @@ if uploaded_file is not None:
             if heatmap is None:
                 st.error("Grad-CAM generation failed.")
             else:
-                heatmap_img = make_heatmap_image(heatmap)
-                overlay_img = overlay_heatmap(img_array, heatmap, alpha=0.50)
+                heatmap_img = make_heatmap_image(
+                    heatmap,
+                    threshold_percentile=heatmap_threshold
+                )
+
+                overlay_img = overlay_heatmap(
+                    img_array,
+                    heatmap,
+                    alpha=gradcam_alpha,
+                    threshold_percentile=heatmap_threshold
+                )
 
                 g1, g2, g3 = st.columns(3)
 
@@ -517,11 +620,11 @@ if uploaded_file is not None:
                 st.markdown(
                     """
                     **Grad-CAM interpretation:**  
-                    The highlighted warm regions indicate the image areas that contributed most strongly
-                    to the model's prediction. In this visualization, the model is expected to focus on
-                    visible defect-related regions such as pothole surfaces, cracks, damaged road edges,
-                    or open-drain structures. This explanation is intended for visual interpretability
-                    and does not represent pixel-level segmentation.
+                    The highlighted warm regions indicate image areas that contributed most strongly
+                    to the model's prediction. The visualization is expected to focus on visible
+                    defect-related regions such as pothole surfaces, cracks, damaged road edges,
+                    or open-drain structures. This explanation supports visual interpretability
+                    but does **not** represent pixel-level segmentation.
                     """
                 )
 
