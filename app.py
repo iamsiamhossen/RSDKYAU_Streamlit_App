@@ -3,7 +3,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, ImageFilter
 from tensorflow import keras
 
 # ============================================================
@@ -31,6 +31,12 @@ CLASS_NAMES = [
 
 IMG_SIZE = (224, 224)
 
+# PIL compatibility for resampling
+try:
+    RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
+except AttributeError:
+    RESAMPLE_BICUBIC = Image.BICUBIC
+
 # ============================================================
 # LOAD MODEL
 # ============================================================
@@ -48,23 +54,21 @@ def load_trained_model():
             safe_mode=False
         )
         return model
-
     except Exception as e:
         st.error("Model loading failed.")
         st.exception(e)
         st.stop()
 
-
 model = load_trained_model()
 
 # ============================================================
-# SMALL HELPERS FOR SAFE SHAPE HANDLING
+# SAFE HELPERS
 # ============================================================
 
 def get_tensor_shape_safe(output_object):
     """
-    Some Keras layers may return a list/tuple output.
-    This function safely returns tensor shape or None.
+    Safely return tensor shape.
+    Some layers may return list/tuple outputs.
     """
     try:
         if isinstance(output_object, (list, tuple)):
@@ -76,7 +80,6 @@ def get_tensor_shape_safe(output_object):
             return output_object.shape
 
         return None
-
     except Exception:
         return None
 
@@ -87,52 +90,34 @@ def is_4d_output(layer):
     """
     try:
         shape = get_tensor_shape_safe(layer.output)
-        if shape is not None and len(shape) == 4:
-            return True
-        return False
+        return shape is not None and len(shape) == 4
     except Exception:
         return False
 
 
-# ============================================================
-# DEBUG HELPER
-# ============================================================
-
 def get_model_layer_summary():
     rows = []
-
     for i, layer in enumerate(model.layers):
-        layer_type = type(layer).__name__
-
         try:
-            if isinstance(layer, keras.Model):
-                total_sub_layers = len(layer.layers)
-            else:
-                total_sub_layers = "-"
+            sub_layers = len(layer.layers) if isinstance(layer, keras.Model) else "-"
         except Exception:
-            total_sub_layers = "-"
+            sub_layers = "-"
 
         rows.append({
             "Index": i,
             "Layer Name": layer.name,
-            "Layer Type": layer_type,
-            "Sub Layers": total_sub_layers
+            "Layer Type": type(layer).__name__,
+            "Sub Layers": sub_layers
         })
-
     return pd.DataFrame(rows)
 
-
 # ============================================================
-# PREPARE GRAD-CAM MODELS
+# PREPARE GRAD-CAM
 # ============================================================
 
-@st.cache_resource
 def prepare_gradcam_models():
     try:
-        # ----------------------------------------------------
-        # Find nested Keras models inside full model
-        # Usually: data_augmentation and densenet121
-        # ----------------------------------------------------
+        # Find nested keras models inside the full saved model
         nested_models = [
             layer for layer in model.layers
             if isinstance(layer, keras.Model)
@@ -158,10 +143,7 @@ def prepare_gradcam_models():
                 "total_layers": total_layers
             })
 
-        # ----------------------------------------------------
-        # Pick model with most 4D feature layers.
-        # This avoids choosing data_augmentation mistakenly.
-        # ----------------------------------------------------
+        # Prefer model with most 4D layers and more total layers
         candidate_models = sorted(
             candidate_models,
             key=lambda x: (x["conv_like_layer_count"], x["total_layers"]),
@@ -173,36 +155,46 @@ def prepare_gradcam_models():
             for c in candidate_models
         ])
 
+        if candidate_models[0]["conv_like_layer_count"] == 0:
+            return None, None, None, f"No convolution-like nested model found. Candidates: {debug_text}"
+
         base_model = candidate_models[0]["model"]
 
-        if candidate_models[0]["conv_like_layer_count"] == 0:
-            return None, None, None, (
-                f"No convolution-like nested model found. Candidates: {debug_text}"
-            )
+        # ----------------------------------------------------
+        # Choose a slightly earlier higher-resolution feature layer
+        # Prefer 14x14 or larger; last 7x7 layer often gives blurry CAM
+        # ----------------------------------------------------
+        all_4d_layers = []
 
-        if len(base_model.layers) < 20:
-            return None, None, None, (
-                f"Selected nested model '{base_model.name}' has too few layers. "
-                f"Candidates: {debug_text}"
-            )
+        for sub_layer in base_model.layers:
+            try:
+                shape = get_tensor_shape_safe(sub_layer.output)
+
+                if shape is not None and len(shape) == 4:
+                    h = int(shape[1]) if shape[1] is not None else 0
+                    w = int(shape[2]) if shape[2] is not None else 0
+
+                    if h > 0 and w > 0:
+                        all_4d_layers.append((sub_layer, h, w))
+            except Exception:
+                continue
+
+        if len(all_4d_layers) == 0:
+            return None, None, None, f"No suitable 4D feature layer found. Candidates: {debug_text}"
+
+        # Prefer final 14x14 or larger feature map
+        high_res_layers = [item for item in all_4d_layers if item[1] >= 14 and item[2] >= 14]
+
+        if len(high_res_layers) > 0:
+            selected_layer, h, w = high_res_layers[-1]
+        else:
+            selected_layer, h, w = all_4d_layers[-1]
+
+        selected_shape = f"{h}x{w}"
+        last_conv_layer = selected_layer
 
         # ----------------------------------------------------
-        # Find last 4D feature layer inside DenseNet base
-        # ----------------------------------------------------
-        last_conv_layer = None
-
-        for sub_layer in reversed(base_model.layers):
-            if is_4d_output(sub_layer):
-                last_conv_layer = sub_layer
-                break
-
-        if last_conv_layer is None:
-            return None, None, None, (
-                f"No suitable 4D convolutional feature layer found. Candidates: {debug_text}"
-            )
-
-        # ----------------------------------------------------
-        # Find classifier head layers after selected base model
+        # Build classifier head from layers after base_model
         # ----------------------------------------------------
         try:
             base_index = model.layers.index(base_model)
@@ -214,29 +206,16 @@ def prepare_gradcam_models():
         if len(classifier_layers) == 0:
             return None, None, None, "No classifier head layers found after base model."
 
-        # ----------------------------------------------------
-        # Base output handling
-        # ----------------------------------------------------
         base_output = base_model.output
-
         if isinstance(base_output, (list, tuple)):
             base_output = base_output[0]
 
-        # ----------------------------------------------------
-        # Feature extractor:
-        # input image -> last feature map + base output
-        # ----------------------------------------------------
         feature_extractor = keras.Model(
             inputs=base_model.input,
             outputs=[last_conv_layer.output, base_output]
         )
 
-        # ----------------------------------------------------
-        # Classifier head model:
-        # base output -> final prediction
-        # ----------------------------------------------------
         classifier_input_shape = tuple(base_output.shape[1:])
-
         classifier_input = keras.Input(shape=classifier_input_shape)
         x = classifier_input
 
@@ -250,7 +229,8 @@ def prepare_gradcam_models():
 
         status = (
             f"Grad-CAM ready. Selected base model: {base_model.name}; "
-            f"last feature layer: {last_conv_layer.name}. Candidates: {debug_text}"
+            f"selected feature layer: {last_conv_layer.name}; "
+            f"feature map size: {selected_shape}. Candidates: {debug_text}"
         )
 
         return feature_extractor, classifier_model, last_conv_layer.name, status
@@ -262,7 +242,7 @@ def prepare_gradcam_models():
 feature_extractor, classifier_model, gradcam_layer_name, gradcam_status = prepare_gradcam_models()
 
 # ============================================================
-# IMAGE PROCESSING FUNCTIONS
+# IMAGE PROCESSING
 # ============================================================
 
 def prepare_raw_image(image):
@@ -278,8 +258,9 @@ def prepare_raw_image(image):
 def predict_image(image):
     img_array, img_batch = prepare_raw_image(image)
 
-    # The saved full model already contains preprocessing from training.
-    # Therefore raw 0-255 image batch is passed directly to full model.
+    # Important:
+    # This assumes your saved full model already contains preprocessing
+    # from training. তাই full model-এ raw image batch pass করা হচ্ছে.
     probs = model.predict(img_batch, verbose=0)[0]
 
     pred_idx = int(np.argmax(probs))
@@ -287,7 +268,6 @@ def predict_image(image):
     confidence = float(probs[pred_idx])
 
     return pred_class, confidence, probs, img_array, pred_idx
-
 
 # ============================================================
 # GRAD-CAM FUNCTIONS
@@ -298,17 +278,12 @@ def generate_gradcam(img_array, pred_index=None):
         return None
 
     try:
-        # Since we bypass the full model and directly use DenseNet base,
-        # DenseNet preprocessing is needed here.
+        # Since we directly use DenseNet base, base preprocessing is needed
         input_tensor = np.expand_dims(img_array.copy(), axis=0)
         input_tensor = keras.applications.densenet.preprocess_input(input_tensor)
 
         with tf.GradientTape() as tape:
-            conv_outputs, base_outputs = feature_extractor(
-                input_tensor,
-                training=False
-            )
-
+            conv_outputs, base_outputs = feature_extractor(input_tensor, training=False)
             tape.watch(conv_outputs)
 
             preds = classifier_model(base_outputs, training=False)
@@ -343,32 +318,66 @@ def generate_gradcam(img_array, pred_index=None):
         return None
 
 
+def refine_heatmap(heatmap):
+    """
+    Improve visibility of Grad-CAM:
+    - normalize
+    - suppress weak background activation
+    - slightly sharpen strong regions
+    """
+    heatmap = np.maximum(heatmap, 0)
+    heatmap = heatmap / (np.max(heatmap) + 1e-8)
+
+    # Suppress weak activation
+    threshold = np.percentile(heatmap, 55)
+    heatmap = np.where(heatmap >= threshold, heatmap, 0)
+
+    # Slight contrast enhancement
+    heatmap = np.power(heatmap, 0.8)
+    heatmap = heatmap / (np.max(heatmap) + 1e-8)
+
+    return heatmap
+
+
 def make_heatmap_image(heatmap):
+    heatmap = refine_heatmap(heatmap)
+
     heatmap_img = Image.fromarray(np.uint8(255 * heatmap))
-    heatmap_img = heatmap_img.resize(IMG_SIZE)
+    heatmap_img = heatmap_img.resize(IMG_SIZE, resample=RESAMPLE_BICUBIC)
+    heatmap_img = heatmap_img.filter(ImageFilter.GaussianBlur(radius=2))
 
     heatmap_array = np.array(heatmap_img).astype(np.float32) / 255.0
 
+    # Professional black-red-yellow heatmap
     color_heatmap = np.zeros((IMG_SIZE[1], IMG_SIZE[0], 3), dtype=np.uint8)
 
-    # Red-yellow heatmap without OpenCV/matplotlib
+    # Red channel strong
     color_heatmap[..., 0] = np.uint8(255 * heatmap_array)
-    color_heatmap[..., 1] = np.uint8(180 * heatmap_array)
-    color_heatmap[..., 2] = 0
+
+    # Green grows in stronger regions
+    green_component = np.maximum(heatmap_array - 0.25, 0) / 0.75
+    color_heatmap[..., 1] = np.uint8(220 * green_component)
+
+    # Low blue for visual smoothness
+    color_heatmap[..., 2] = np.uint8(30 * (1 - heatmap_array) * (heatmap_array > 0))
 
     return Image.fromarray(color_heatmap)
 
 
-def overlay_heatmap(original_img_array, heatmap, alpha=0.45):
-    original = Image.fromarray(
-        original_img_array.astype(np.uint8)
-    ).convert("RGBA")
+def overlay_heatmap(original_img_array, heatmap, alpha=0.50):
+    original = Image.fromarray(original_img_array.astype(np.uint8)).convert("RGBA")
 
-    heatmap_img = Image.fromarray(np.uint8(255 * heatmap)).resize(IMG_SIZE)
+    heatmap = refine_heatmap(heatmap)
+
+    heatmap_img = Image.fromarray(np.uint8(255 * heatmap))
+    heatmap_img = heatmap_img.resize(IMG_SIZE, resample=RESAMPLE_BICUBIC)
+    heatmap_img = heatmap_img.filter(ImageFilter.GaussianBlur(radius=2))
+
     heatmap_array = np.array(heatmap_img).astype(np.float32) / 255.0
 
     overlay_rgba = np.zeros((IMG_SIZE[1], IMG_SIZE[0], 4), dtype=np.uint8)
 
+    # Red-yellow overlay
     overlay_rgba[..., 0] = 255
     overlay_rgba[..., 1] = np.uint8(180 * heatmap_array)
     overlay_rgba[..., 2] = 0
@@ -378,7 +387,6 @@ def overlay_heatmap(original_img_array, heatmap, alpha=0.45):
     combined = Image.alpha_composite(original, overlay).convert("RGB")
 
     return combined
-
 
 # ============================================================
 # STREAMLIT UI
@@ -487,7 +495,7 @@ if uploaded_file is not None:
                 st.error("Grad-CAM generation failed.")
             else:
                 heatmap_img = make_heatmap_image(heatmap)
-                overlay_img = overlay_heatmap(img_array, heatmap, alpha=0.45)
+                overlay_img = overlay_heatmap(img_array, heatmap, alpha=0.50)
 
                 g1, g2, g3 = st.columns(3)
 
@@ -509,10 +517,11 @@ if uploaded_file is not None:
                 st.markdown(
                     """
                     **Grad-CAM interpretation:**  
-                    Warmer highlighted regions indicate the image areas that contributed
-                    more strongly to the model's prediction. This helps visually inspect
-                    whether the model is focusing on relevant road-damage regions rather
-                    than irrelevant background.
+                    The highlighted warm regions indicate the image areas that contributed most strongly
+                    to the model's prediction. In this visualization, the model is expected to focus on
+                    visible defect-related regions such as pothole surfaces, cracks, damaged road edges,
+                    or open-drain structures. This explanation is intended for visual interpretability
+                    and does not represent pixel-level segmentation.
                     """
                 )
 
